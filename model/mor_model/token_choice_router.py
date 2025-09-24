@@ -117,10 +117,13 @@ class MoRLlamaDecoderLayer(nn.Module):
                 for b in range(new_bs):
                     indices = selected_seq_indices[b]
                     s = indices.numel()
+
+                    orig_b = selected_batch_indices[b]
                     
-                    _mask = torch.gather(attention_mask, 2, indices.view(1, 1, s, 1).expand(bs, 1, s, seq_len))
-                    _mask = torch.gather(_mask, 3, indices.view(1, 1, 1, s).expand(bs, 1, s, s))
-                    new_attention_mask[b, :, :s, :s] = _mask                
+                    attn_b = attention_mask[orig_b:orig_b+1, :, :, :]
+                    _mask = torch.gather(attn_b, 2, indices.view(1, 1, s, 1).expand(1, 1, s, seq_len))
+                    _mask = torch.gather(_mask, 3, indices.view(1, 1, 1, s).expand(1, 1, s, s))
+                    new_attention_mask[b, :, :s, :s] = _mask           
             elif attention_mask.dim() == 2:
                 pass
             else: 
