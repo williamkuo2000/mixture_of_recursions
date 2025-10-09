@@ -28,6 +28,8 @@ class MoRLlamaDecoderLayer(nn.Module):
         self.block_list = block_list
         self.cfg = cfg
         self.bal_warmup_step = bal_warmup_step
+        # Enable differentiable soft-routing only during alignment
+        self.soft_router_training = False
         
         self.training_step = 0
         self.num_recursion = cfg.recursive.num_recursion
@@ -74,13 +76,10 @@ class MoRLlamaDecoderLayer(nn.Module):
         
         for i in range(x.shape[0]):  
             indices = torch.where(top_expert_indices[i] >= index)[0]
-            
             if indices.numel() == 0:
                 continue
-            else:
-                selected_batch_indices.append(i)
-                selected_seq_indices.append(indices)
-                
+            selected_batch_indices.append(i)
+            selected_seq_indices.append(indices)
             batched_x.append(x[i, indices])
         
         if len(batched_x) == 0:
@@ -95,36 +94,45 @@ class MoRLlamaDecoderLayer(nn.Module):
         new_bs, new_seq_len, _ = batched_x.shape
         bs, seq_len, _ = x.shape
                 
+        # Default 2D mask (if needed downstream)
         new_attention_mask = torch.zeros(
             (new_bs, new_seq_len),
             dtype=x.dtype,
             device=x.device,
         )
         for b in range(new_bs):
-            indices = selected_seq_indices[b]
-            s = indices.numel()
-            
+            s = selected_seq_indices[b].numel()
             new_attention_mask[b, :s] = 1
-            
+        
+        # If we have a 4D mask (causal + padding, inverted), remap it per selected original batch row/col
         if attention_mask is not None: 
             if attention_mask.dim() == 4:
-                new_attention_mask = torch.ones(
+                # Prepare 4D mask container, initialized to min (masked)
+                min_val = torch.finfo(attention_mask.dtype).min
+                fourd_mask = torch.full(
                     (new_bs, 1, new_seq_len, new_seq_len),
+                    fill_value=min_val,
                     dtype=attention_mask.dtype,
                     device=attention_mask.device,
-                ) * torch.finfo(attention_mask.dtype).min
-                
+                )
                 for b in range(new_bs):
+                    orig_b = selected_batch_indices[b]  # original batch index
                     indices = selected_seq_indices[b]
                     s = indices.numel()
-
-                    orig_b = selected_batch_indices[b]
-                    
-                    attn_b = attention_mask[orig_b:orig_b+1, :, :, :]
-                    _mask = torch.gather(attn_b, 2, indices.view(1, 1, s, 1).expand(1, 1, s, seq_len))
-                    _mask = torch.gather(_mask, 3, indices.view(1, 1, 1, s).expand(1, 1, s, s))
-                    new_attention_mask[b, :, :s, :s] = _mask           
+                    if s == 0:
+                        continue
+                    # Slice the original mask to this batch first to avoid broadcasting over bs
+                    mask_b = attention_mask[orig_b : orig_b + 1]  # [1, 1, seq_len, seq_len]
+                    # Gather rows, then columns using indices
+                    row_idx = indices.view(1, 1, s, 1).expand(1, 1, s, mask_b.shape[-1])
+                    mask_rows = torch.gather(mask_b, 2, row_idx)
+                    col_idx = indices.view(1, 1, 1, s).expand(1, 1, s, s)
+                    mask_sel = torch.gather(mask_rows, 3, col_idx)  # [1, 1, s, s]
+                    fourd_mask[b, :, :s, :s] = mask_sel
+                # Use the constructed 4D mask
+                new_attention_mask = fourd_mask.contiguous()
             elif attention_mask.dim() == 2:
+                # keep the simple 2D (bs, seqlen) mask already built above
                 pass
             else: 
                 raise NotImplementedError("Attention mask has unexpected dimensions")
@@ -137,17 +145,17 @@ class MoRLlamaDecoderLayer(nn.Module):
         if position_embeddings is not None:
             head_dim = position_embeddings[0].shape[-1]            
             new_position_embeddings = ()
-            
             for i, emb in enumerate(position_embeddings):
-                new_position_embeddings += (torch.zeros(
+                new_emb = torch.zeros(
                     (new_bs, new_seq_len, head_dim),
                     dtype=emb.dtype,
                     device=emb.device,
-                ),)
+                )
                 for b in range(new_bs):
                     indices = selected_seq_indices[b]
                     s = indices.numel()
-                    new_position_embeddings[i][b, :s] = torch.gather(emb[0], dim=0, index=indices.view(s, 1).expand(-1, head_dim))
+                    new_emb[b, :s] = torch.gather(emb[0], dim=0, index=indices.view(s, 1).expand(-1, head_dim))
+                new_position_embeddings += (new_emb,)
         
         new_cache_position = None                    
         if cache_position is not None:
@@ -159,7 +167,6 @@ class MoRLlamaDecoderLayer(nn.Module):
             for b in range(new_bs):
                 indices = selected_seq_indices[b]
                 s = indices.numel()
-                
                 new_cache_position[b, :s] = torch.gather(cache_position, dim=0, index=indices)
         
         return batched_x, new_attention_mask, new_position_ids, new_cache_position, new_position_embeddings, selected_batch_indices, selected_seq_indices
@@ -185,11 +192,20 @@ class MoRLlamaDecoderLayer(nn.Module):
         final_x, updates = x.clone(), x.clone()
         
         if not self.cfg.mor.rand_router:
-            # Top-1 token-choice routing
-            router_weights = self.mor_router(x / self.cfg.mor.temp) 
+            # Top-1 token-choice routing with numerical stability
+            x_normalized = x / self.cfg.mor.temp
+            # Clamp to prevent extreme values
+            x_normalized = torch.clamp(x_normalized, min=-100, max=100)
+            
+            router_weights = self.mor_router(x_normalized)
+            # Clamp router weights to prevent overflow
+            router_weights = torch.clamp(router_weights, min=-10, max=10)
+            
             if "router_func" in self.cfg.mor.token and self.cfg.mor.token.router_func == "sigmoid":
                 router_probs = _router_probs = F.sigmoid(router_weights) * self.cfg.mor.token.get("alpha", 0.1) 
             else:
+                # Subtract max for numerical stability in softmax
+                router_weights = router_weights - router_weights.max(dim=-1, keepdim=True)[0]
                 router_probs = _router_probs = F.softmax(router_weights, dim=-1) * self.cfg.mor.token.get("alpha", 1.0)
             
             if self.cfg.mor.token.balancing == "loss_free":
@@ -198,6 +214,47 @@ class MoRLlamaDecoderLayer(nn.Module):
         else:
             router_weights = torch.rand(bs, seq_len, self.num_recursion, device=x.device, dtype=x.dtype)
             router_probs = _router_probs = router_weights * self.cfg.mor.token.get("alpha", 0.1)
+        
+        # Soft-routing path for alignment: run all recursions and weighted-sum outputs by router probs
+        if self.training and getattr(self, "soft_router_training", False):
+            outputs_per_recur = []
+            for index, block in enumerate(self.block_list):
+                batched_x = x
+                new_attention_mask = attention_mask
+                new_position_ids = position_ids
+                new_cache_position = cache_position
+                new_position_embeddings = position_embeddings
+                for blk in block:
+                    out_blk = blk(
+                        batched_x,
+                        attention_mask=new_attention_mask,
+                        position_ids=new_position_ids,
+                        past_key_value=None,
+                        output_attentions=output_attentions,
+                        use_cache=False,
+                        cache_position=new_cache_position,
+                        position_embeddings=new_position_embeddings,
+                        **kwargs,
+                    )
+                    batched_x = out_blk[0]
+                outputs_per_recur.append(batched_x)
+            Y = torch.stack(outputs_per_recur, dim=-1)  # [bs, seq, hidden, num_rec]
+            final_x = (Y * router_probs.unsqueeze(2)).sum(dim=-1)
+            # Guard against non-finite values
+            final_x = torch.nan_to_num(final_x, nan=0.0, posinf=0.0, neginf=0.0)
+            return MoRLayerOutputWithPast(
+                hidden_state=final_x,
+                attention_weights=None,
+                selected_tokens=None,
+                sampling_loss=None,
+                sampling_acc=None,
+                sampling_topk_acc=None,
+                uniformity=None,
+                dead_token_seq=None,
+                balancing_loss=None,
+                balancing_ratio=None,
+                router_z_loss=None,
+            )
         
         if self.training and self.training_step < self.bal_warmup_step:
             top_expert_indices = torch.ones(bs, seq_len, 1, device=x.device, dtype=torch.long) * (self.num_recursion - 1)
@@ -208,8 +265,11 @@ class MoRLlamaDecoderLayer(nn.Module):
         weights = torch.gather(_router_probs, dim=-1, index=top_expert_indices) # [bs, seq_len, 1]
         top_expert_indices = top_expert_indices.squeeze(-1)  # [bs, seq_len]
         
+        # Disable inner KV cache to avoid DynamicCache shape mismatches with variable sub-batches
+        inner_use_cache = False
+        inner_past_key_value = None
+        
         for index, block in enumerate(self.block_list): 
-                        
             if 'kv_sharing' in self.cfg and self.cfg.kv_sharing.enable:
                 batched_x = x.clone()
                 new_attention_mask = attention_mask
@@ -229,7 +289,6 @@ class MoRLlamaDecoderLayer(nn.Module):
                             top_expert_indices=top_expert_indices, 
                             index=index, 
                         )
-                
                 if batched_x is None:
                     continue
             
@@ -238,9 +297,9 @@ class MoRLlamaDecoderLayer(nn.Module):
                     batched_x,
                     attention_mask=new_attention_mask,
                     position_ids=new_position_ids,
-                    past_key_value=past_key_value,
+                    past_key_value=inner_past_key_value,  # no inner cache
                     output_attentions=output_attentions,
-                    use_cache=use_cache,
+                    use_cache=inner_use_cache,            # no inner cache
                     cache_position=new_cache_position,
                     position_embeddings=new_position_embeddings,
                     **kwargs
@@ -264,7 +323,6 @@ class MoRLlamaDecoderLayer(nn.Module):
                 batched_x_processed = outputs[0]
         
             for i, batch_idx in enumerate(selected_batch_indices):
-                
                 processed_indices = selected_seq_indices[i] 
                 processed_unpad_x = batched_x_processed[i, :processed_indices.numel()] 
                 processed_expert_indices = torch.gather(top_expert_indices[i], dim=0, index=processed_indices)
@@ -286,9 +344,7 @@ class MoRLlamaDecoderLayer(nn.Module):
                 if index < self.num_recursion - 1:
                     unfinished_indices = torch.where(processed_expert_indices > index)[0]
                     unfinished_indices_in_total = processed_indices[unfinished_indices]
-                    
                     unfinished_src = torch.gather(processed_unpad_x, dim=0, index=unfinished_indices.view(-1, 1).expand(-1, hidden_dim)) 
-                    
                     updates[batch_idx] = torch.scatter(
                         x[batch_idx],
                         dim=0,
@@ -307,16 +363,16 @@ class MoRLlamaDecoderLayer(nn.Module):
                 balancing_ratio = torch.bincount(top_expert_indices.view(-1), minlength=self.num_recursion) / (bs * seq_len)
                 f_i = self.num_recursion * balancing_ratio
                 balancing_loss = sum(P_i * f_i) / (kwargs["num_items_in_batch"] / bs / seq_len)
-                
             elif self.cfg.mor.token.balancing == "loss_free":
                 balancing_loss = None
                 balancing_ratio = torch.bincount(top_expert_indices.view(-1), minlength=self.num_recursion) / (bs * seq_len)
-                
             if "z_loss" in self.cfg.mor and self.cfg.mor.z_loss:   
                 router_z_loss = torch.logsumexp(router_weights, dim=-1)
                 router_z_loss = torch.square(router_z_loss)
                 router_z_loss = router_z_loss.mean() / (kwargs["num_items_in_batch"] / bs / seq_len)           
             
+        # Guard against non-finite values
+        final_x = torch.nan_to_num(final_x, nan=0.0, posinf=0.0, neginf=0.0)
         return MoRLayerOutputWithPast(
             hidden_state=final_x,
             attention_weights=outputs[1:],
