@@ -103,13 +103,15 @@ class TuneMLPRouter(nn.Module):
         # LayerNorm for input stabilization
         self.ln = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps if hasattr(config, 'layer_norm_eps') else 1e-5)
         
+        param_size = 256
+
         # MLP router
         self.router = nn.Sequential(
-            nn.Linear(config.hidden_size, 128, bias=True),
+            nn.Linear(config.hidden_size, param_size, bias=True),
             nn.GELU(),
-            nn.Linear(128, 128, bias=True),
+            nn.Linear(param_size, param_size, bias=True),
             nn.GELU(),
-            nn.Linear(128, out_dim, bias=True)
+            nn.Linear(param_size, out_dim, bias=True)
         )
         
         # Learnable depth bias for residual connection
