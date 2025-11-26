@@ -309,5 +309,10 @@ def sharing_strategy(cfg, model):
 
                     for idx in idxs[1:]:
                         getattr(model.model.layers[idx], key).weight = ref_weights #[key]
+
+            # Collapse modules to a single shared instance so LoRA attaches once per physical layer
+            ref_layer = model.model.layers[idxs[0]]
+            for idx in idxs[1:]:
+                model.model.layers[idx] = ref_layer
     
     return model, lora_init_dict

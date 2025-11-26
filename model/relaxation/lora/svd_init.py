@@ -1,6 +1,7 @@
 import re
 
 import torch
+from tqdm import tqdm
 
 from util.misc import get_torch_dtype
 
@@ -11,7 +12,12 @@ def svd_init_lora_weights(cfg, peft_model, lora_init_dict, rank_pattern):
     
     lora_A_updates, lora_B_updates = {}, {}
     
-    for key, init_weight in lora_init_dict.items():
+    items = list(lora_init_dict.items())
+    for key, init_weight in tqdm(
+        items,
+        desc="Initializing LoRA with SVD",
+        leave=False,
+    ):
         layer_idx, layer_name = key.split("_", 1)
         
         with torch.no_grad():

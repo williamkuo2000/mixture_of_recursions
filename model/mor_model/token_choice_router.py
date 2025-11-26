@@ -30,12 +30,18 @@ class MoRLlamaDecoderLayer(nn.Module):
         self.bal_warmup_step = bal_warmup_step
         # Enable differentiable soft-routing only during alignment
         self.soft_router_training = False
+        self.router_history = []  # list of tensors for inspection (eval/debug only)
+        self.kv_selective = False
+        if hasattr(self.cfg, "kv_sharing"):
+            # Optional flag to respect token routing even with kv_sharing enabled
+            self.kv_selective = bool(getattr(self.cfg.kv_sharing, "selective_forward", False))
         
         self.training_step = 0
         self.num_recursion = cfg.recursive.num_recursion
         assert len(block_list) == self.num_recursion, "Number of recursion should be equal to number of blocks"
         
         torch_dtype = get_torch_dtype(cfg)
+        self.last_router_choices = None  # populated in forward for inspection
         
         if not cfg.mor.rand_router:
             self.mor_router = ROUTER_TYPES[cfg.mor.router_type](config, out_dim=self.num_recursion).to(torch_dtype)
@@ -264,33 +270,58 @@ class MoRLlamaDecoderLayer(nn.Module):
             _, top_expert_indices = torch.topk(router_probs, 1, dim=-1, sorted=False)
         weights = torch.gather(_router_probs, dim=-1, index=top_expert_indices) # [bs, seq_len, 1]
         top_expert_indices = top_expert_indices.squeeze(-1)  # [bs, seq_len]
+        if not self.training:
+            # Keep a lightweight copy for instrumentation/inspection tools
+            detached = top_expert_indices.detach().cpu()
+            self.last_router_choices = detached
+            self.router_history.append(detached)
+            self.last_router_probs = router_probs.detach().cpu()
         
         # Disable inner KV cache to avoid DynamicCache shape mismatches with variable sub-batches
         inner_use_cache = False
         inner_past_key_value = None
         
         for index, block in enumerate(self.block_list): 
-            if 'kv_sharing' in self.cfg and self.cfg.kv_sharing.enable:
+            if 'kv_sharing' in self.cfg and self.cfg.kv_sharing.enable and not self.kv_selective:
                 batched_x = x.clone()
                 new_attention_mask = attention_mask
                 new_position_ids = position_ids
                 new_cache_position = cache_position
                 new_position_embeddings = position_embeddings
+                selected_batch_indices = list(range(x.shape[0]))
+                selected_seq_indices = [torch.arange(x.shape[1], device=x.device)] * x.shape[0]
                         
-            else: 
-                batched_x, new_attention_mask, new_position_ids, new_cache_position, new_position_embeddings, \
-                    selected_batch_indices, selected_seq_indices = \
-                        self.select_tokens_and_batch_with_padding(
-                            x,
-                            attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            cache_position=cache_position,
-                            position_embeddings=position_embeddings,
-                            top_expert_indices=top_expert_indices, 
-                            index=index, 
-                        )
-                if batched_x is None:
-                    continue
+            else:
+                # Fast-path: if every valid token in a batch is routed here, avoid padding/gather
+                fast_path = False
+                tokens_per_batch = (top_expert_indices >= index).sum(dim=1)
+                if attention_mask is not None and attention_mask.dim() == 2:
+                    valid_tokens = attention_mask.sum(dim=1)
+                    fast_path = torch.equal(tokens_per_batch, valid_tokens)
+                elif attention_mask is None:
+                    fast_path = bool((tokens_per_batch == seq_len).all())
+                if fast_path and tokens_per_batch.min().item() > 0:
+                    selected_batch_indices = torch.arange(x.shape[0], device=x.device)
+                    selected_seq_indices = [torch.arange(seq_len, device=x.device) for _ in range(x.shape[0])]
+                    batched_x = x
+                    new_attention_mask = attention_mask
+                    new_position_ids = position_ids
+                    new_cache_position = cache_position
+                    new_position_embeddings = position_embeddings
+                else:
+                    batched_x, new_attention_mask, new_position_ids, new_cache_position, new_position_embeddings, \
+                        selected_batch_indices, selected_seq_indices = \
+                            self.select_tokens_and_batch_with_padding(
+                                x,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                cache_position=cache_position,
+                                position_embeddings=position_embeddings,
+                                top_expert_indices=top_expert_indices, 
+                                index=index, 
+                            )
+                    if batched_x is None:
+                        continue
             
             for blk in block: 
                 outputs = blk(
@@ -306,7 +337,7 @@ class MoRLlamaDecoderLayer(nn.Module):
                 )
                 batched_x = outputs[0]
                 
-            if 'kv_sharing' in self.cfg and self.cfg.kv_sharing.enable:
+            if 'kv_sharing' in self.cfg and self.cfg.kv_sharing.enable and not self.kv_selective:
                 batched_x_processed, _, _, _, _, selected_batch_indices, selected_seq_indices = \
                     self.select_tokens_and_batch_with_padding(
                             batched_x,

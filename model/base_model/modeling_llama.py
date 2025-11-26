@@ -25,6 +25,12 @@ from transformers.utils import (
 from transformers import LlamaConfig
 from transformers.utils.deprecation import deprecate_kwarg
 
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    print("flash_attn not installed, LlamaFlashAttention2 will not be available")
+    flash_attn_func = None
+    
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
@@ -280,12 +286,117 @@ class LlamaAttention(nn.Module):
         return attn_output, attn_weights
 
 
+class LlamaFlashAttention2(LlamaAttention):
+    """
+    Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
+    untouched. The only required change would be on the forward pass where it needs to correctly swap the dimensions
+    of the key and value states.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        # Project to (B, S, H, D)
+        query_states = self.q_proj(hidden_states).view(hidden_shape)
+        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        value_states = self.v_proj(hidden_states).view(hidden_shape)
+
+        # RoPE in (B, S, H, D)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, unsqueeze_dim=2)
+
+        if past_key_value is not None:
+            # Cache requires (B, H, S, D)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+            
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            
+            # Back to (B, S, H, D) for Flash Attn
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+
+        # Check for padding (if attention_mask has zeros)
+        # Note: In FA2, attention_mask is usually None for causal, but if passed, we check it.
+        has_padding = False
+        if attention_mask is not None:
+            # attention_mask is (B, 1, S, S) or similar. 0.0 means masked (padding).
+            # But transformers uses additive mask (0.0 for keep, -inf for mask) or boolean?
+            # FA2 integration usually handles this.
+            # For safety, if attention_mask is present, we assume potential padding and use wrapper.
+            has_padding = True
+
+        if not has_padding and flash_attn_func is not None:
+            q_len = query_states.shape[1]
+            k_len = key_states.shape[1]
+            is_causal = True
+            use_fast_path = True
+            
+            if q_len != k_len:
+                if q_len == 1:
+                    is_causal = False
+                else:
+                    # Fallback for complex cases (e.g. chunked prefill with mismatch)
+                    use_fast_path = False
+            
+            if use_fast_path:
+                # Direct call to FA2 (fast path, no extra transposes)
+                dropout_p = self.attention_dropout if self.training else 0.0
+                attn_output = flash_attn_func(
+                    query_states,
+                    key_states,
+                    value_states,
+                    dropout_p=dropout_p,
+                    softmax_scale=self.scaling,
+                    causal=is_causal,
+                )
+                attn_weights = None
+        else:
+            use_fast_path = False
+
+        if not use_fast_path:
+            # Fallback to wrapper (slower, handles padding/transposes)
+            # Wrapper expects (B, H, S, D)
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+            
+            attention_interface: Callable = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
 class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        if config._attn_implementation == "flash_attention_2":
+            self.self_attn = LlamaFlashAttention2(config=config, layer_idx=layer_idx)
+        else:
+            self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
